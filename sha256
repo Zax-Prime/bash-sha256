@@ -18,6 +18,13 @@
 
 LC_ALL=C
 
+shopt -s expand_aliases
+if [[ -n $DEBUG ]]; then
+	alias debug=debug-func
+else
+	alias debug=#
+fi
+
 U32_MASK=0xffffffff
 
 block=()
@@ -229,10 +236,8 @@ process-input() {
 	fi
 }
 
-debug() {
-	if [[ -n $DEBUG ]]; then
-		echo '[DEBUG]' "$@" >&2
-	fi
+debug-func() {
+	echo '[DEBUG]' "$@" >&2
 	return 0
 }
 

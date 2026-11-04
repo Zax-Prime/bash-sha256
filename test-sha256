@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+target="${1:-./sha256}"
+
+if [[ ! -f "$target" ]]; then
+	echo "Error: target script '$target' not found." >&2
+	exit 1
+fi
+
 declare -A files=(
 	[files/empty.txt]='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 	[files/hello.txt]='5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03'
@@ -9,7 +16,7 @@ declare -A files=(
 code=0
 for file in "${!files[@]}"; do
 	want=${files[$file]}
-	have=$(./sha256 < "$file")
+	have=$("$target" < "$file")
 
 	echo -n "checking $file is $want... "
 

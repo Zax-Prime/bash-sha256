@@ -13,6 +13,23 @@ echo 'hello' | ./sha256
 DEBUG=1 ./sha256 file.txt
 ```
 
+Testing
+-------
+
+Run the basic test suite:
+
+```
+./test-sha256 [path/to/sha256]
+```
+
+Run the comprehensive edge-case and correctness verification suite:
+
+```
+./verify-sha256 [path/to/sha256]
+./verify-sha256 --quick
+./verify-sha256 --filter "Boundary"
+```
+
 YouTube
 -------
 

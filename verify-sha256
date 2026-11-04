@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+#
+# verify-sha256: Comprehensive edge-case and correctness verification suite
+#                for SHA-256 implementations.
+#
+# Usage:
+#   ./verify-sha256 [OPTIONS] [path-to-sha256-script]
+#
+# Options:
+#   -h, --help            Show this help message
+#   -v, --verbose         Show detailed output and runtime per test
+#   -q, --quick           Skip large input tests (>2KB) for fast iteration
+#   -f, --filter PATTERN  Run only tests matching regular expression PATTERN
+#   --no-color            Disable ANSI color output
+#
+
+set -o pipefail
+
+# Ensure consistent byte interpretation in shell
+LC_ALL=C
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ==============================================================================
+# Configuration & Argument Parsing
+# ==============================================================================
+
+SCRIPT_TARGET=""
+VERBOSE=0
+QUICK=0
+FILTER=""
+USE_COLOR=1
+
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+	USE_COLOR=1
+else
+	USE_COLOR=0
+fi
+
+usage() {
+	cat <<USAGE_TEXT
+Usage: $(basename "$0") [OPTIONS] [path-to-sha256-script]
+
+Edge-case and correctness verification suite for SHA-256 scripts.
+If no script path is provided, defaults to './sha256'.
+
+Options:
+  -h, --help            Show this help message and exit
+  -v, --verbose         Print detailed execution information and per-test timing
+  -q, --quick           Skip tests with inputs larger than 2KB for fast testing
+  -f, --filter PATTERN  Only execute tests whose names match regex PATTERN
+  --no-color            Disable colorized terminal output
+
+Exit Status:
+  0 if all executed tests pass, 1 if any test fails or invalid arguments.
+USAGE_TEXT
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-v|--verbose)
+			VERBOSE=1
+			shift
+			;;
+		-q|--quick)
+			QUICK=1
+			shift
+			;;
+		-f|--filter)
+			if [[ -z "${2:-}" ]]; then
+				echo "Error: --filter requires a pattern argument" >&2
+				exit 1
+			fi
+			FILTER="$2"
+			shift 2
+			;;
+		--no-color)
+			USE_COLOR=0
+			shift
+			;;
+		-*)
+			echo "Error: Unknown option '$1'" >&2
+			usage >&2
+			exit 1
+			;;
+		*)
+			if [[ -z "$SCRIPT_TARGET" ]]; then
+				SCRIPT_TARGET="$1"
+			else
+				echo "Error: Multiple target scripts specified: '$SCRIPT_TARGET' and '$1'" >&2
+				usage >&2
+				exit 1
+			fi
+			shift
+			;;
+	esac
+done
+
+# Default target script if not explicitly provided
+if [[ -z "$SCRIPT_TARGET" ]]; then
+	if [[ -f "./sha256" ]]; then
+		SCRIPT_TARGET="./sha256"
+	elif [[ -f "$REPO_DIR/sha256" ]]; then
+		SCRIPT_TARGET="$REPO_DIR/sha256"
+	else
+		echo "Error: No target script specified and './sha256' not found." >&2
+		usage >&2
+		exit 1
+	fi
+fi
+
+if [[ ! -f "$SCRIPT_TARGET" ]]; then
+	echo "Error: Target script '$SCRIPT_TARGET' does not exist." >&2
+	exit 1
+fi
+
+# If target script is a naked filename without slashes, prefix with ./
+if [[ "$SCRIPT_TARGET" != */* ]]; then
+	SCRIPT_TARGET="./$SCRIPT_TARGET"
+fi
+
+# Ensure executable or resolve runner
+if [[ -x "$SCRIPT_TARGET" ]]; then
+	RUNNER=("$SCRIPT_TARGET")
+else
+	RUNNER=(bash "$SCRIPT_TARGET")
+fi
+
+# ==============================================================================
+# Styling & Formatting Helpers
+# ==============================================================================
+
+if ((USE_COLOR == 1)); then
+	C_RESET=$'\033[0m'
+	C_BOLD=$'\033[1m'
+	C_DIM=$'\033[2m'
+	C_GREEN=$'\033[32m'
+	C_RED=$'\033[31m'
+	C_YELLOW=$'\033[33m'
+	C_CYAN=$'\033[36m'
+	C_MAGENTA=$'\033[35m'
+else
+	C_RESET=""
+	C_BOLD=""
+	C_DIM=""
+	C_GREEN=""
+	C_RED=""
+	C_YELLOW=""
+	C_CYAN=""
+	C_MAGENTA=""
+fi
+
+# ==============================================================================
+# Reference SHA-256 Engine
+# ==============================================================================
+
+REF_TOOL=""
+if command -v sha256sum >/dev/null 2>&1; then
+	REF_TOOL="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+	REF_TOOL="shasum"
+elif command -v openssl >/dev/null 2>&1; then
+	REF_TOOL="openssl"
+fi
+
+get_ref_hash_from_file() {
+	local file=$1
+	case "$REF_TOOL" in
+		sha256sum)
+			sha256sum "$file" | awk '{print $1}'
+			;;
+		shasum)
+			shasum -a 256 "$file" | awk '{print $1}'
+			;;
+		openssl)
+			openssl dgst -sha256 -r "$file" | awk '{print $1}'
+			;;
+		*)
+			echo ""
+			;;
+	esac
+}
+
+# ==============================================================================
+# Temporary Directory & Test State
+# ==============================================================================
+
+TEST_TMPDIR=$(mktemp -d -t sha256_verify_XXXXXX)
+cleanup() {
+	rm -rf "$TEST_TMPDIR"
+}
+trap cleanup EXIT INT TERM
+
+PASSED_COUNT=0
+FAILED_COUNT=0
+SKIPPED_COUNT=0
+TOTAL_COUNT=0
+CURRENT_CATEGORY=""
+
+print_category() {
+	local title=$1
+	CURRENT_CATEGORY="$title"
+	echo
+	echo "${C_BOLD}${C_CYAN}─── $title ───${C_RESET}"
+}
+
+# ==============================================================================
+# Assertion and Runner Functions
+# ==============================================================================
+
+run_test() {
+	local test_name=$1
+	local mode=$2         # pipe, stdin, file, error
+	local input_file=$3   # file path or argument
+	local expected=$4     # expected hash or exit code
+	local desc=${5:-}
+
+	# Check filter
+	if [[ -n "$FILTER" ]] && ! [[ "$test_name" =~ $FILTER ]]; then
+		return 0
+	fi
+
+	((TOTAL_COUNT++))
+
+	local start_ns have code=0 output err_output
+	local elapsed_ms="0"
+	if date +%s%N >/dev/null 2>&1; then
+		start_ns=$(date +%s%N)
+	fi
+
+	local have_clean=""
+	local test_passed=0
+
+	case "$mode" in
+		pipe)
+			# Feed input_file via standard pipe (cat "$input_file" | RUNNER)
+			output=$(cat "$input_file" | "${RUNNER[@]}" 2>"$TEST_TMPDIR/err.log")
+			code=$?
+			;;
+		stdin)
+			# Redirect input_file via stdin (< "$input_file")
+			output=$("${RUNNER[@]}" < "$input_file" 2>"$TEST_TMPDIR/err.log")
+			code=$?
+			;;
+		file)
+			# Pass file path as argument
+			output=$("${RUNNER[@]}" "$input_file" 2>"$TEST_TMPDIR/err.log")
+			code=$?
+			;;
+		error)
+			# Expected to fail (non-zero exit code)
+			output=$("${RUNNER[@]}" "$input_file" 2>"$TEST_TMPDIR/err.log")
+			code=$?
+			;;
+		*)
+			echo "Unknown test mode: $mode" >&2
+			((FAILED_COUNT++))
+			return 1
+			;;
+	esac
+
+	if [[ -n "$start_ns" ]]; then
+		local end_ns=$(date +%s%N)
+		elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+	fi
+
+	# Clean output (extract single line hash, ignore trailing spaces or carriage return)
+	have_clean=$(echo "$output" | tr -d '\r' | tr -d ' ' | head -n 1)
+
+	if [[ "$mode" == "error" ]]; then
+		# Error test: expected is non-zero exit code
+		if ((code != 0)); then
+			test_passed=1
+		fi
+	else
+		# Normal test: exit code must be 0 and hash must match expected
+		if ((code == 0)) && [[ "$have_clean" == "$expected" ]]; then
+			test_passed=1
+		fi
+	fi
+
+	# Print results
+	if ((test_passed == 1)); then
+		((PASSED_COUNT++))
+		if ((VERBOSE == 1)); then
+			printf "  ${C_GREEN}[PASS]${C_RESET} %-50s ${C_DIM}(%sms)${C_RESET}\n" "$test_name" "$elapsed_ms"
+		else
+			printf "  ${C_GREEN}[PASS]${C_RESET} %s\n" "$test_name"
+		fi
+	else
+		((FAILED_COUNT++))
+		printf "  ${C_RED}[FAIL]${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$test_name"
+		if [[ -n "$desc" ]]; then
+			echo "         ${C_DIM}Description: $desc${C_RESET}"
+		fi
+		if [[ "$mode" == "error" ]]; then
+			echo "         Expected: Non-zero exit code"
+			echo "         Actual:   Exit code $code (output: '$output')"
+		else
+			echo "         Expected: ${C_GREEN}$expected${C_RESET}"
+			echo "         Actual:   ${C_RED}${have_clean:-<empty>}${C_RESET} (exit code: $code)"
+		fi
+		if [[ -s "$TEST_TMPDIR/err.log" ]]; then
+			echo "         Stderr:   $(head -n 2 "$TEST_TMPDIR/err.log")"
+		fi
+	fi
+}
+
+skip_test() {
+	local test_name=$1
+	local reason=$2
+
+	if [[ -n "$FILTER" ]] && ! [[ "$test_name" =~ $FILTER ]]; then
+		return 0
+	fi
+
+	((TOTAL_COUNT++))
+	((SKIPPED_COUNT++))
+	printf "  ${C_YELLOW}[SKIP]${C_RESET} %-50s ${C_DIM}(%s)${C_RESET}\n" "$test_name" "$reason"
+}
+
+# ==============================================================================
+# Banner & System Info
+# ==============================================================================
+
+echo "${C_BOLD}======================================================================${C_RESET}"
+echo "${C_BOLD}          SHA-256 Edge Case & Correctness Verification Suite          ${C_RESET}"
+echo "${C_BOLD}======================================================================${C_RESET}"
+echo "Target Script:    ${C_BOLD}$SCRIPT_TARGET${C_RESET} (runner: ${RUNNER[*]})"
+echo "Bash Version:     ${BASH_VERSION}"
+echo "Reference Engine: ${REF_TOOL:-None (using embedded truth vectors)}"
+if ((QUICK == 1)); then
+	echo "Mode:             ${C_YELLOW}Quick Mode (skipping tests > 2KB)${C_RESET}"
+fi
+if [[ -n "$FILTER" ]]; then
+	echo "Filter:           ${C_YELLOW}$FILTER${C_RESET}"
+fi
+
+# ==============================================================================
+# Category 1: NIST / FIPS 180-4 Standard Vectors
+# ==============================================================================
+print_category "NIST / FIPS 180-4 Standard Vectors"
+
+# 1.1 Empty input (0 bytes)
+f_empty="$TEST_TMPDIR/nist_empty.bin"
+: > "$f_empty"
+run_test "NIST: Empty message (0 bytes)" \
+	pipe "$f_empty" \
+	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+	"FIPS 180-4 empty string test vector"
+
+# 1.2 "abc" (3 bytes)
+f_abc="$TEST_TMPDIR/nist_abc.bin"
+printf 'abc' > "$f_abc"
+run_test "NIST: 'abc' (3 bytes)" \
+	pipe "$f_abc" \
+	"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" \
+	"FIPS 180-4 standard 3-byte test vector"
+
+# 1.3 56-byte vector: "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+# Exactly 448 bits = 56 bytes. Tests block boundary padding transition.
+f_56="$TEST_TMPDIR/nist_56.bin"
+printf 'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq' > "$f_56"
+run_test "NIST: 56-byte multi-block transition" \
+	pipe "$f_56" \
+	"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1" \
+	"FIPS 180-4 448-bit (56-byte) multi-block transition vector"
+
+# 1.4 112-byte vector (two full 448-bit segments concatenated)
+f_112="$TEST_TMPDIR/nist_112.bin"
+printf 'abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu' > "$f_112"
+run_test "NIST: 112-byte 2-block vector" \
+	pipe "$f_112" \
+	"cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1" \
+	"FIPS 180-4 896-bit (112-byte) test vector"
+
+# ==============================================================================
+# Category 2: Block Size & Padding Boundary Edge Cases
+# SHA-256 block size is 64 bytes (512 bits).
+# Padding appends 0x80 (1 byte), k zeros, and an 8-byte length field.
+# - If len % 64 <= 55: fits in current block (0x80 + zeros + 8 bytes len <= 64)
+# - If len % 64 >= 56: spills into next block (0x80 + zeros + 8 bytes len > 64)
+# ==============================================================================
+print_category "Block Size & Padding Boundary Edge Cases (64-byte blocks)"
+
+test_lengths=(0 1 54 55 56 57 63 64 65 118 119 120 121 127 128 129)
+for len in "${test_lengths[@]}"; do
+	test_file="$TEST_TMPDIR/block_len_${len}.bin"
+	head -c "$len" /dev/zero | tr '\0' 'A' > "$test_file"
+	exp_hash=$(get_ref_hash_from_file "$test_file")
+
+	desc="Input length: $len bytes of 'A'"
+	if ((len == 55)); then
+		desc="Max data size fitting padding + 8B length in 1 block (55 + 1 + 8 = 64)"
+	elif ((len == 56)); then
+		desc="CRITICAL: 1st boundary forcing expansion to 2 blocks (56 + 1 > 56)"
+	elif ((len == 64)); then
+		desc="Exactly 1 full data block; padding spills into 2nd block"
+	elif ((len == 119)); then
+		desc="Max data size fitting padding + 8B length in 2 blocks (119 + 1 + 8 = 128)"
+	elif ((len == 120)); then
+		desc="CRITICAL: 2nd boundary forcing expansion to 3 blocks (120 + 1 > 120)"
+	elif ((len == 128)); then
+		desc="Exactly 2 full data blocks; padding spills into 3rd block"
+	fi
+
+	run_test "Boundary: $len bytes ('A' x $len)" \
+		file "$test_file" \
+		"$exp_hash" \
+		"$desc"
+done
+
+# ==============================================================================
+# Category 3: Read & I/O Buffer Boundaries (4096-byte chunk size)
+# In many bash implementations, input is buffered in 4096-byte reads ('read -n 4096').
+# ==============================================================================
+print_category "Read / Buffer Chunk Boundaries (4096-byte buffers)"
+
+buffer_lengths=(4094 4095 4096 4097 8192)
+for len in "${buffer_lengths[@]}"; do
+	if ((QUICK == 1)) && ((len > 2048)); then
+		skip_test "Buffer boundary: $len bytes" "Skipped in quick mode"
+		continue
+	fi
+
+	test_file="$TEST_TMPDIR/buf_len_${len}.bin"
+	head -c "$len" /dev/zero | tr '\0' 'X' > "$test_file"
+	exp_hash=$(get_ref_hash_from_file "$test_file")
+
+	desc="Buffer boundary check at $len bytes"
+	if ((len == 4095)); then
+		desc="Buffer size minus 1 byte"
+	elif ((len == 4096)); then
+		desc="Exact 4096-byte read buffer boundary"
+	elif ((len == 4097)); then
+		desc="Exact buffer boundary + 1 byte (spans into 2nd chunk)"
+	elif ((len == 8192)); then
+		desc="Exact 2 buffer chunks (2 x 4096 bytes)"
+	fi
+
+	run_test "Buffer boundary: $len bytes" \
+		file "$test_file" \
+		"$exp_hash" \
+		"$desc"
+done
+
+# ==============================================================================
+# Category 4: Binary Data & NUL Byte Extremes
+# Bash variables and built-in 'read' treat NUL (\x00) specially.
+# ==============================================================================
+print_category "Binary Data & NUL Byte Handling"
+
+# 4.1 Single NUL byte
+file_null1="$TEST_TMPDIR/nul_1.bin"
+printf '\x00' > "$file_null1"
+run_test "Binary: Single NUL byte (\\x00)" \
+	file "$file_null1" \
+	"$(get_ref_hash_from_file "$file_null1")" \
+	"Single isolated zero byte"
+
+# 4.2 Multiple consecutive NUL bytes
+file_null5="$TEST_TMPDIR/nul_5.bin"
+printf '\x00\x00\x00\x00\x00' > "$file_null5"
+run_test "Binary: 5 consecutive NUL bytes" \
+	file "$file_null5" \
+	"$(get_ref_hash_from_file "$file_null5")" \
+	"Multiple consecutive zero bytes"
+
+# 4.3 64 NUL bytes (exact 1 block of all zeros)
+file_null64="$TEST_TMPDIR/nul_64.bin"
+head -c 64 /dev/zero > "$file_null64"
+run_test "Binary: 64 NUL bytes (full block of zeros)" \
+	file "$file_null64" \
+	"$(get_ref_hash_from_file "$file_null64")" \
+	"A full 64-byte block of 0x00"
+
+# 4.4 Embedded NUL bytes surrounded by ASCII text
+file_emb_nul="$TEST_TMPDIR/nul_embedded.bin"
+printf 'pre\x00middle\x00post' > "$file_emb_nul"
+run_test "Binary: Embedded NULs ('pre\\0middle\\0post')" \
+	file "$file_emb_nul" \
+	"$(get_ref_hash_from_file "$file_emb_nul")" \
+	"NUL characters embedded inside text"
+
+# 4.5 Leading and trailing NULs
+file_lead_trail="$TEST_TMPDIR/nul_lead_trail.bin"
+printf '\x00\x00content\x00\x00' > "$file_lead_trail"
+run_test "Binary: Leading and trailing NUL bytes" \
+	file "$file_lead_trail" \
+	"$(get_ref_hash_from_file "$file_lead_trail")" \
+	"NUL bytes at start and end of payload"
+
+# 4.6 NUL byte exactly at 4096-byte chunk boundary
+if ((QUICK == 0)); then
+	file_nul_boundary="$TEST_TMPDIR/nul_at_4096.bin"
+	# 4095 'A's + 1 NUL + 'B'
+	{ head -c 4095 /dev/zero | tr '\0' 'A'; printf '\x00B'; } > "$file_nul_boundary"
+	run_test "Binary: NUL at 4096-byte buffer boundary" \
+		file "$file_nul_boundary" \
+		"$(get_ref_hash_from_file "$file_nul_boundary")" \
+		"NUL delimiter occurring right at chunk boundary (byte 4096)"
+else
+	skip_test "Binary: NUL at 4096-byte buffer boundary" "Skipped in quick mode"
+fi
+
+# 4.7 All 0xFF bytes (64 bytes)
+file_ff64="$TEST_TMPDIR/ff_64.bin"
+head -c 64 /dev/zero | tr '\0' '\377' > "$file_ff64"
+run_test "Binary: 64 bytes of 0xFF (all 1-bits)" \
+	file "$file_ff64" \
+	"$(get_ref_hash_from_file "$file_ff64")" \
+	"Full block of 0xFF (all bits set)"
+
+# 4.8 Alternating bit patterns (0x55 and 0xAA)
+file_alt_bits="$TEST_TMPDIR/alt_bits.bin"
+{
+	head -c 32 /dev/zero | tr '\0' '\125'  # 0x55 = 01010101
+	head -c 32 /dev/zero | tr '\0' '\252'  # 0xAA = 10101010
+} > "$file_alt_bits"
+run_test "Binary: Alternating bit patterns (0x55, 0xAA)" \
+	file "$file_alt_bits" \
+	"$(get_ref_hash_from_file "$file_alt_bits")" \
+	"Bitwise alternating masks"
+
+# 4.9 Full byte range: all 256 byte values 0x00 .. 0xFF
+file_all_bytes="$TEST_TMPDIR/all_256_bytes.bin"
+for ((b = 0; b < 256; b++)); do
+	printf "\\$(printf '%03o' "$b")"
+done > "$file_all_bytes"
+run_test "Binary: Full 256 byte set (0x00 to 0xFF)" \
+	file "$file_all_bytes" \
+	"$(get_ref_hash_from_file "$file_all_bytes")" \
+	"Complete 8-bit octet space"
+
+# 4.10 Multi-byte UTF-8 symbols
+file_utf8="$TEST_TMPDIR/utf8.txt"
+printf 'Hello 🌍, 世界! üöä' > "$file_utf8"
+run_test "UTF-8: Multi-byte unicode characters" \
+	file "$file_utf8" \
+	"$(get_ref_hash_from_file "$file_utf8")" \
+	"UTF-8 encoded multi-byte character sequence"
+
+# ==============================================================================
+# Category 5: Whitespace, Line Endings & Formatting
+# ==============================================================================
+print_category "Whitespace & Line Endings"
+
+# 5.1 Single newline
+file_nl="$TEST_TMPDIR/nl.txt"
+printf '\n' > "$file_nl"
+run_test "Whitespace: Single newline ('\\n')" \
+	pipe "$file_nl" \
+	"$(get_ref_hash_from_file "$file_nl")" \
+	"Single LF character"
+
+# 5.2 CRLF (Windows line ending)
+file_crlf="$TEST_TMPDIR/crlf.txt"
+printf '\r\n' > "$file_crlf"
+run_test "Whitespace: CRLF ('\\r\\n')" \
+	pipe "$file_crlf" \
+	"$(get_ref_hash_from_file "$file_crlf")" \
+	"Carriage return + Line feed"
+
+# 5.3 Trailing newline vs no trailing newline
+file_hello_no_nl="$TEST_TMPDIR/hello_no_nl.txt"
+printf 'hello' > "$file_hello_no_nl"
+run_test "Whitespace: 'hello' (no newline)" \
+	pipe "$file_hello_no_nl" \
+	"$(get_ref_hash_from_file "$file_hello_no_nl")" \
+	"Literal 'hello' without newline"
+
+file_hello_nl="$TEST_TMPDIR/hello_nl.txt"
+printf 'hello\n' > "$file_hello_nl"
+run_test "Whitespace: 'hello\\n' (with newline)" \
+	pipe "$file_hello_nl" \
+	"$(get_ref_hash_from_file "$file_hello_nl")" \
+	"Literal 'hello' with newline (matches files/hello.txt)"
+
+# 5.4 Spaces and tabs only
+file_ws="$TEST_TMPDIR/whitespace_only.txt"
+printf '  \t  \t\t ' > "$file_ws"
+run_test "Whitespace: Mixed spaces and tabs" \
+	file "$file_ws" \
+	"$(get_ref_hash_from_file "$file_ws")" \
+	"Only whitespace characters"
+
+# ==============================================================================
+# Category 6: Invocation Modes & CLI Interface
+# ==============================================================================
+print_category "Invocation Modes & CLI Interface"
+
+# 6.1 Stdin via pipe
+file_pipe_in="$TEST_TMPDIR/pipe_test.txt"
+printf 'testing pipe input' > "$file_pipe_in"
+run_test "Interface: Stdin via pipe" \
+	pipe "$file_pipe_in" \
+	"$(get_ref_hash_from_file "$file_pipe_in")" \
+	"Piping data into script via stdin pipe"
+
+# 6.2 Stdin via redirection (< file)
+file_redir="$TEST_TMPDIR/stdin_redir.txt"
+printf 'redirection test content' > "$file_redir"
+run_test "Interface: Stdin via redirection (< file)" \
+	stdin "$file_redir" \
+	"$(get_ref_hash_from_file "$file_redir")" \
+	"Passing input via stdin redirection"
+
+# 6.3 Stdin from /dev/null
+run_test "Interface: Stdin from /dev/null" \
+	stdin "/dev/null" \
+	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+	"Empty stdin redirected from /dev/null"
+
+# 6.4 File path as argument
+file_arg="$TEST_TMPDIR/arg_test.txt"
+printf 'argument file content' > "$file_arg"
+run_test "Interface: File path argument (\$1)" \
+	file "$file_arg" \
+	"$(get_ref_hash_from_file "$file_arg")" \
+	"Passing file path as command line argument"
+
+# 6.5 Filename containing spaces
+file_spaces="$TEST_TMPDIR/file with spaces and special @#$ characters.txt"
+printf 'file with unusual filename' > "$file_spaces"
+run_test "Interface: Filename with spaces and symbols" \
+	file "$file_spaces" \
+	"$(get_ref_hash_from_file "$file_spaces")" \
+	"File argument path containing spaces"
+
+# 6.6 Existing repository fixtures
+if [[ -f "$REPO_DIR/files/empty.txt" ]]; then
+	run_test "Fixture: files/empty.txt" \
+		file "$REPO_DIR/files/empty.txt" \
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+		"Repository sample file: empty.txt"
+fi
+
+if [[ -f "$REPO_DIR/files/hello.txt" ]]; then
+	run_test "Fixture: files/hello.txt" \
+		file "$REPO_DIR/files/hello.txt" \
+		"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03" \
+		"Repository sample file: hello.txt"
+fi
+
+if [[ -f "$REPO_DIR/files/random_4kb.bin" ]]; then
+	if ((QUICK == 1)); then
+		skip_test "Fixture: files/random_4kb.bin" "Skipped in quick mode"
+	else
+		run_test "Fixture: files/random_4kb.bin" \
+			file "$REPO_DIR/files/random_4kb.bin" \
+			"b822f930e9b0c646c177c80b7fa9781cb9941613c419900e34f16ce5023b38c7" \
+			"Repository sample file: random_4kb.bin"
+	fi
+fi
+
+# ==============================================================================
+# Category 7: Error Handling & Exit Codes
+# ==============================================================================
+print_category "Error Handling & Exit Codes"
+
+# 7.1 Non-existent file argument
+run_test "Error: Non-existent file argument" \
+	error "$TEST_TMPDIR/this_file_does_not_exist_987654.txt" \
+	"1" \
+	"Must return non-zero exit code on missing file"
+
+# ==============================================================================
+# Category 8: Output Format Conformance
+# ==============================================================================
+print_category "Output Format Conformance"
+
+# 8.1 Exactly 64 lowercase hexadecimal characters
+test_format_name="Format: Exactly 64 lowercase hex characters"
+if [[ -z "$FILTER" ]] || [[ "$test_format_name" =~ $FILTER ]]; then
+	((TOTAL_COUNT++))
+	out_raw=$("${RUNNER[@]}" <<< "format test" 2>"$TEST_TMPDIR/err.log")
+	out_trim=$(echo "$out_raw" | tr -d '\r\n')
+	len=${#out_trim}
+
+	if [[ "$len" -eq 64 ]] && [[ "$out_trim" =~ ^[0-9a-f]{64}$ ]]; then
+		((PASSED_COUNT++))
+		printf "  ${C_GREEN}[PASS]${C_RESET} %s\n" "$test_format_name"
+	else
+		((FAILED_COUNT++))
+		printf "  ${C_RED}[FAIL]${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$test_format_name"
+		echo "         Expected: 64 lowercase hex characters [0-9a-f]{64}"
+		echo "         Actual:   Length $len: '$out_trim'"
+	fi
+fi
+
+# 8.2 Exactly one trailing newline (no trailing space or extra blank lines)
+test_nl_name="Format: Exactly one trailing newline (no trailing whitespace)"
+if [[ -z "$FILTER" ]] || [[ "$test_nl_name" =~ $FILTER ]]; then
+	((TOTAL_COUNT++))
+	nl=$'\n'
+	out_raw=$("${RUNNER[@]}" <<< "format test" 2>"$TEST_TMPDIR/err.log"; echo x)
+	out_raw="${out_raw%x}"
+	raw_len=${#out_raw}
+	stripped="${out_raw%$nl}"
+
+	if (( raw_len == 65 )) && [[ "${out_raw: -1}" == "$nl" ]] && [[ "$stripped" =~ ^[0-9a-f]{64}$ ]]; then
+		((PASSED_COUNT++))
+		printf "  ${C_GREEN}[PASS]${C_RESET} %s\n" "$test_nl_name"
+	else
+		((FAILED_COUNT++))
+		printf "  ${C_RED}[FAIL]${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$test_nl_name"
+		echo "         Expected: Exactly 65 bytes (64 hex characters + single \\n)"
+		echo "         Actual:   Length $raw_len: $(printf '%q' "$out_raw")"
+	fi
+fi
+
+# ==============================================================================
+# Final Summary Report
+# ==============================================================================
+echo
+echo "${C_BOLD}======================================================================${C_RESET}"
+echo "${C_BOLD}                           Test Summary                               ${C_RESET}"
+echo "${C_BOLD}======================================================================${C_RESET}"
+printf "Total Tests:   %d\n" "$TOTAL_COUNT"
+printf "Passed:        ${C_GREEN}%d${C_RESET}\n" "$PASSED_COUNT"
+if ((FAILED_COUNT > 0)); then
+	printf "Failed:        ${C_RED}%d${C_RESET}\n" "$FAILED_COUNT"
+else
+	printf "Failed:        0\n"
+fi
+if ((SKIPPED_COUNT > 0)); then
+	printf "Skipped:       ${C_YELLOW}%d${C_RESET}\n" "$SKIPPED_COUNT"
+fi
+
+if ((FAILED_COUNT == 0)); then
+	echo
+	echo "${C_BOLD}${C_GREEN}✔ ALL TESTS PASSED!${C_RESET}"
+	exit 0
+else
+	echo
+	echo "${C_BOLD}${C_RED}✘ VERIFICATION FAILED with ${FAILED_COUNT} failure(s).${C_RESET}"
+	exit 1
+fi
